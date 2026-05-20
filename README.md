@@ -1,74 +1,105 @@
 # plume
 
-A 100% client-side blogging platform for Solid. Light as a feather.
+A blog that lives on your Solid pod.
 
-**Live**: [solid-apps.github.io/plume](https://solid-apps.github.io/plume/)
+**[solid-apps.github.io/plume](https://solid-apps.github.io/plume/)**
 
-## Why
+---
 
-WordPress is the most successful publishing platform ever built — and it owns 40% of the web because it nailed five things: 5-minute install, themes you can swap, plugins you can extend, backwards compatibility for life, and a story that grew from "blog" into "everything."
+## The idea
 
-Plume is the same shape — minus the parts that don't translate to a world where users own their data:
+WordPress made publishing easy. Plume aims for the same simplicity, with one
+change: **your posts are not in a database** — they're plain JSON-LD files
+on a Solid pod that you own. The reader app and the data are decoupled.
+Swap plume for another blog app tomorrow and your posts come with you.
 
-- **Data lives on your pod, not a database.** Every post is a `schema:BlogPosting` JSON-LD resource at `<your-pod>/public/post/<slug>.jsonld`. Any pod-aware app can read it. You can replace Plume with another blogging app tomorrow and your content is still there.
-- **The reader is the runtime.** Visit `solid-apps.github.io/plume/?pod=https://alice.solidcommunity.net` and you're reading alice's blog. Visit it with `?pod=https://bob.solidcommunity.net` and you're reading bob's. Same UI, different pod, different blog.
-- **Federate without bridges.** Comments, mentions, replies live as resources on the responder's pod — discoverable via WebID and TypeIndex, federated by the open web instead of a vendor.
-- **No PHP, no MySQL, no plugins-as-attack-surface.** Plume is a small bundle of HTML + CSS + JS. JSS does the rest.
+The same plume install can read any blog on any pod:
 
-## Status
+- `solid-apps.github.io/plume/?pod=https://alice.solidcommunity.net` reads alice's blog
+- `solid-apps.github.io/plume/?pod=https://bob.example` reads bob's
+- Same UI, different pod, different blog
 
-Phase 1 (PoC). Write + read + list posts. Markdown via `marked`. xlogin auth (Solid OIDC + Nostr).
+Log into your own pod and `+ Write` appears in the corner.
 
-## Roadmap
+## What works today
 
-| Phase | Scope |
-|---|---|
-| **1 — PoC** | Compose markdown post; save to `/public/post/`; index page lists posts; permalink view; xlogin auth |
-| 2 | Edit / unpublish (PUT existing post; soft-delete) |
-| 3 | Categories + tags (`?tag=solid` filtered listing) |
-| 4 | RSS / Atom feed derived from the container listing |
-| 5 | Comments — per-post sub-container, each comment a `schema:Comment` federated via WebID |
-| 6 | Multi-author blogs — pod publishes a `schema:Blog` with `schema:author` list; other authors post via WAC |
-| 7 | Webmention / federation — outbound webmentions, inbox endpoint, optional ActivityPub bridge |
-| 8 | Mashlib pane — any `schema:BlogPosting` URL renders via plume's BlogPostingPane inside hub-mashlib |
+- **Write** — markdown editor with live preview (toggle with `⌘ + P`); posts saved as `schema:BlogPosting` JSON-LD
+- **Read** — clean reader with serif typography, drop cap, per-blog masthead pulled from the owner's WebID profile
+- **Edit / delete** — only the original author sees the controls
+- **Tags** — `?tag=solid` filters the index; chips appear on cards and permalinks
+- **Comments** — federated by pod: each comment is a `schema:Comment` on the responder's storage, but linked back to the post via `schema:about`
+- **Enable Comments toggle** — the post author flips a WAC ACL granting `acl:Append` to authenticated users on the per-post comment container
+- **Atom feed** — real `feed.xml` lives on the pod; any RSS reader can subscribe; auto-discoverable via `<link rel="alternate">`
+- **Multi-auth** — Solid OIDC and Nostr (via [xlogin](https://github.com/solid-contrib/xlogin))
+- **Per-pod identity** — same plume URL transforms into "alice's writing" or "bob's writing" based on the owner's pod profile
 
-## Data shape
+## How data is laid out
 
-Each post is one resource at `/public/post/<slug>.jsonld`:
+Every post is one resource:
+
+```
+<pod>/public/post/<slug>.jsonld
+```
 
 ```json
 {
   "@context": { "schema": "https://schema.org/" },
   "@id": "",
   "@type": "schema:BlogPosting",
-  "schema:headline": "First Post",
+  "schema:headline": "First Contact",
   "schema:articleBody": "...markdown body...",
   "schema:datePublished": "2026-05-20T10:00:00Z",
-  "schema:author": { "@id": "https://alice.pod/profile/card#me" }
+  "schema:dateModified": "2026-05-21T09:14:00Z",
+  "schema:author": { "@id": "https://alice.pod/profile/card#me" },
+  "schema:keywords": ["solid", "blogging"]
 }
 ```
 
-The `articleBody` is markdown. Plume renders it client-side; other apps can render it however they like, or treat the post as plain text.
+Comments mirror the same idea:
 
-## URL params
+```
+<pod>/public/comment/<post-slug>/<timestamp>-<rand>.jsonld
+```
 
-- `?pod=https://alice.pod` — read another pod's blog (your Plume install becomes a reader for any blog on any pod)
-- `?post=<resource-url>` — permalink for a single post
-- `?new` — compose a new post (requires login)
+```json
+{
+  "@context": { "schema": "https://schema.org/" },
+  "@id": "",
+  "@type": "schema:Comment",
+  "schema:text": "Great post!",
+  "schema:dateCreated": "2026-05-20T11:02:00Z",
+  "schema:author": { "@id": "https://bob.pod/profile/card#me" },
+  "schema:about": { "@id": "https://alice.pod/public/post/first-contact.jsonld" }
+}
+```
 
-## Sibling apps
+The Atom feed is at `<pod>/public/post/feed.xml` and is regenerated on
+publish, edit, or delete.
 
-- [`solid-apps/plaza`](https://github.com/solid-apps/plaza) — group chat
-- [`solid-apps/timeline`](https://github.com/solid-apps/timeline) — Facebook-style social feed
-- [`solid-apps/hub`](https://github.com/solid-apps/hub) — multi-app workspace
-- [`solid-apps/explorer`](https://github.com/solid-apps/explorer) — file manager
-- [`solid-chat/app`](https://github.com/solid-chat/app) — direct messaging
+## URL parameters
 
-## Inspired by
+| Param | Effect |
+|---|---|
+| `?pod=https://alice.pod` | Read another pod's blog — plume becomes a reader for any blog on any pod |
+| `?post=<resource-url>` | Permalink for a single post |
+| `?tag=<tag>` | Filter index by tag |
+| `?new` | Compose (requires login) |
+| `?edit=<resource-url>` | Edit (author only) |
 
-The original [solid-plume](https://github.com/happybeing/solid-plume) by happybeing — the same thesis (decoupled data, replaceable app), modernised for the JSON-LD-first / xlogin-auth / suite-coherent solid-apps shape.
+## Roadmap
 
-## Local dev
+| Phase | Scope | Status |
+|---|---|---|
+| 1 | Write / read / list | shipped |
+| 2 | Edit / delete | shipped |
+| 3 | Tags / categories | shipped |
+| 4 | Atom feed | shipped |
+| 5 | Comments | shipped |
+| 6 | Multi-author blogs (`schema:Blog` with author list, WAC-gated co-authors) | planned |
+| 7 | Webmention / federation (outbound + inbox endpoint, optional ActivityPub bridge) | planned |
+| 8 | Mashlib pane — any `schema:BlogPosting` URL renders via plume inside hub-mashlib | planned |
+
+## Run it locally
 
 ```bash
 git clone https://github.com/solid-apps/plume.git
@@ -77,6 +108,23 @@ python3 -m http.server 8006
 # open http://localhost:8006/?pod=http://localhost:4443
 ```
 
+No build step, no dependencies, no server. plume is HTML, CSS, and one
+ES module. Everything talks to your Solid pod over HTTP.
+
+## Sibling apps in the suite
+
+- [hub](https://github.com/solid-apps/hub) — multi-app workspace and file mode for any Solid resource
+- [explorer](https://github.com/solid-apps/explorer) — file manager with split panes and per-resource ACL editor
+- [plaza](https://github.com/solid-apps/plaza) — Slack-style group chat
+- [timeline](https://github.com/solid-apps/timeline) — Facebook-style social feed
+- [solid-chat/app](https://github.com/solid-chat/app) — direct messaging
+
+## Inspired by
+
+[solid-plume](https://github.com/happybeing/solid-plume) by happybeing —
+same thesis (decoupled data, replaceable app), updated for the
+JSON-LD-first, xlogin-auth, suite-coherent shape of solid-apps.
+
 ## License
 
-AGPL-3.0-only
+[AGPL-3.0-only](./LICENSE)
