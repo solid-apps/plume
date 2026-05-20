@@ -746,6 +746,20 @@ a:hover { color: var(--accent); }
 .footer a { color: var(--text-soft); }
 .footer a:hover { color: var(--accent-deep); }
 .footer-sep { color: var(--text-muted); opacity: 0.5; }
+.footer-rss {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.rss-glyph {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  background: var(--accent);
+  -webkit-mask: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><path d='M6.18 17.82a2.18 2.18 0 1 1-4.36 0 2.18 2.18 0 0 1 4.36 0zM4 4.44v3.18A12.38 12.38 0 0 1 16.38 20h3.18A15.56 15.56 0 0 0 4 4.44zm0 5.83v3.13A6.55 6.55 0 0 1 10.55 20h3.13A9.69 9.69 0 0 0 4 10.27z'/></svg>") center / contain no-repeat;
+          mask: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><path d='M6.18 17.82a2.18 2.18 0 1 1-4.36 0 2.18 2.18 0 0 1 4.36 0zM4 4.44v3.18A12.38 12.38 0 0 1 16.38 20h3.18A15.56 15.56 0 0 0 4 4.44zm0 5.83v3.13A6.55 6.55 0 0 1 10.55 20h3.13A9.69 9.69 0 0 0 4 10.27z'/></svg>") center / contain no-repeat;
+}
+.footer-rss:hover .rss-glyph { background: var(--accent-deep); }
 
 /* — toast — */
 

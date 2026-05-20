@@ -347,6 +347,7 @@ async function savePost({ headline, body, slug, keywords }) {
     state.posts.unshift(local)
     state.byUrl.set(local.url, local)
   }
+  regenerateFeed()
   return url
 }
 
@@ -383,6 +384,7 @@ async function updatePost(url, { headline, body, keywords }) {
     state.posts = state.posts.map(p => p.url === url ? local : p)
     state.byUrl.set(url, local)
   }
+  regenerateFeed()
   return url
 }
 
@@ -394,6 +396,121 @@ async function deletePost(url) {
   }
   state.posts = state.posts.filter(p => p.url !== url)
   state.byUrl.delete(url)
+  regenerateFeed()
+}
+
+// --- Atom feed ---
+//
+// Each blog is published as a real Atom feed at <pod>/public/post/feed.xml.
+// plume rewrites it whenever a post is saved, edited, or deleted (best
+// effort — silently skips if not the owner). RSS readers discover it via
+// <link rel="alternate" type="application/atom+xml"> in the page head.
+
+const FEED_FILE = 'feed.xml'
+const FEED_MAX = 20
+
+function feedUrl() {
+  return state.blogUrl ? state.blogUrl + FEED_FILE : null
+}
+
+function plumePermalinkFor(postUrl) {
+  const base = location.origin + location.pathname
+  return `${base}?pod=${encodeURIComponent(state.podOrigin)}&post=${encodeURIComponent(postUrl)}`
+}
+
+function blogReaderUrl() {
+  const base = location.origin + location.pathname
+  return `${base}?pod=${encodeURIComponent(state.podOrigin)}`
+}
+
+function buildAtomFeed() {
+  const posts = state.posts.slice(0, FEED_MAX)
+  const owner = state.blogOwnerProfile
+  const ownerWebId = state.blogOwner
+  const host = (() => { try { return new URL(state.podOrigin).host } catch { return 'pod' } })()
+  const ownerName = owner?.name || host
+  const blogTitle = owner?.name
+    ? `${owner.name}${owner.name.endsWith('s') ? "'" : "'s"} writing`
+    : `${host} — plume`
+  const subtitle = owner?.bio || 'light as a feather'
+  const self = feedUrl()
+  const reader = blogReaderUrl()
+  const latest = posts.length
+    ? posts.reduce((m, p) => {
+        const d = p.dateModified || p.dateCreated
+        return d > m ? d : m
+      }, new Date(0))
+    : new Date()
+  const authorBlock = `<name>${escapeHtml(ownerName)}</name>${
+    ownerWebId ? `<uri>${escapeHtml(ownerWebId)}</uri>` : ''
+  }`
+  const entries = posts.map(p => {
+    const link = plumePermalinkFor(p.url)
+    const html = renderMarkdown(p.body)
+    const cats = (p.keywords || [])
+      .map(t => `<category term="${escapeHtml(t)}"/>`).join('')
+    return `<entry>` +
+      `<title>${escapeHtml(p.headline)}</title>` +
+      `<link href="${escapeHtml(link)}"/>` +
+      `<id>${escapeHtml(p.url)}</id>` +
+      `<published>${p.dateCreated.toISOString()}</published>` +
+      `<updated>${(p.dateModified || p.dateCreated).toISOString()}</updated>` +
+      `<author>${authorBlock}</author>` +
+      `<summary>${escapeHtml(excerpt(p.body))}</summary>` +
+      `<content type="html">${escapeHtml(html)}</content>` +
+      cats +
+      `</entry>`
+  }).join('')
+  return `<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+<title>${escapeHtml(blogTitle)}</title>
+<subtitle>${escapeHtml(subtitle)}</subtitle>
+<link href="${escapeHtml(reader)}"/>
+<link rel="self" type="application/atom+xml" href="${escapeHtml(self)}"/>
+<id>${escapeHtml(reader)}</id>
+<updated>${latest.toISOString()}</updated>
+<author>${authorBlock}</author>
+<generator uri="https://github.com/solid-apps/plume">plume</generator>
+${entries}
+</feed>
+`
+}
+
+async function regenerateFeed() {
+  if (!state.blogUrl || !meWebId()) return
+  const url = feedUrl()
+  if (!url) return
+  try {
+    const xml = buildAtomFeed()
+    await authFetch(url, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/atom+xml' },
+      body: xml
+    })
+  } catch {
+    // Best effort — feed regeneration shouldn't block a publish
+  }
+}
+
+function installFeedDiscoveryLink() {
+  if (!state.blogUrl) return
+  const url = feedUrl()
+  if (!url) return
+  let link = document.querySelector('link[rel="alternate"][type="application/atom+xml"]')
+  if (!link) {
+    link = document.createElement('link')
+    link.rel = 'alternate'
+    link.type = 'application/atom+xml'
+    document.head.appendChild(link)
+  }
+  link.href = url
+  link.title = 'Atom feed'
+  // Footer subscribe pill
+  const sub = document.getElementById('footer-subscribe')
+  if (sub) {
+    sub.href = url
+    sub.hidden = false
+  }
 }
 
 // --- comments ---
@@ -1256,6 +1373,7 @@ async function bootForPod(origin) {
   const fp = document.getElementById('footer-pod')
   fp.textContent = origin
   fp.href = origin
+  installFeedDiscoveryLink()
 
   // Kick off owner discovery + posts fetch in parallel
   const ownerP = discoverBlogOwner(origin).then(async (webId) => {
@@ -1292,6 +1410,15 @@ async function bootForPod(origin) {
   }
   applyRoute()
   await ownerP  // not strictly needed but lets the masthead settle before next interaction
+  // One-shot feed backfill — if I'm the pod owner and there isn't a feed
+  // yet (existing blog from before phase 4), write one now so the
+  // Subscribe pill resolves to a real Atom feed without a new post.
+  if (state.blogOwner && meWebId() === state.blogOwner && state.posts.length > 0) {
+    try {
+      const h = await authFetch(feedUrl(), { method: 'HEAD' })
+      if (h.status === 404) regenerateFeed()
+    } catch {}
+  }
 }
 
 function init() {
