@@ -470,25 +470,9 @@ async function postComment(postUrl, text) {
   if (!meWebId()) throw new Error('login required to comment')
   const container = commentContainerForPost(postUrl)
   if (!container) throw new Error('invalid post URL')
-  // Try to create the container — idempotent if it exists. The post
-  // author needs to have granted us write here; if not, we'll 403 on
-  // the PUT below and surface a clear message.
-  try {
-    const parent = container.replace(/[^\/]+\/?$/, '')
-    const slug = container.split('/').filter(Boolean).pop()
-    await authFetch(parent, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'text/turtle',
-        'Slug': slug,
-        'Link': '<http://www.w3.org/ns/ldp#BasicContainer>; rel="type"'
-      },
-      body: ''
-    })
-  } catch {}
   const ts = Date.now()
   const rand = Math.random().toString(36).slice(2, 8)
-  const url = `${container}${ts}-${rand}.jsonld`
+  const slug = `${ts}-${rand}.jsonld`
   const doc = {
     '@context': { schema: SCHEMA },
     '@id': '',
@@ -498,17 +482,27 @@ async function postComment(postUrl, text) {
     'schema:author': { '@id': meWebId() },
     'schema:about': { '@id': postUrl }
   }
-  const r = await authFetch(url, {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/ld+json' },
+  // POST to the container (not PUT to a specific URL) so that
+  // `acl:Append` permission is enough — Append authorises adding new
+  // resources to a container but not arbitrary PUTs.
+  const r = await authFetch(container, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/ld+json',
+      'Slug': slug
+    },
     body: JSON.stringify(doc, null, 2)
   })
   if (!r.ok) {
     if (r.status === 401 || r.status === 403) {
-      throw new Error("Couldn't post comment — the blog author hasn't granted write access on the comments container.")
+      throw new Error("Couldn't post comment — the blog author hasn't enabled comments on this post.")
     }
     await throwOnHttpError(r, 'comment')
   }
+  const loc = r.headers.get('Location') || r.headers.get('location')
+  const url = loc
+    ? new URL(loc, container).toString()
+    : `${container}${slug}`
   return parseComment(doc, url)
 }
 
