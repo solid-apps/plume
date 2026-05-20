@@ -488,6 +488,134 @@ async function deleteComment(url) {
   if (!r.ok && r.status !== 404) await throwOnHttpError(r, 'delete')
 }
 
+// --- "Enable comments" toggle ---
+//
+// When the post author wants others to comment, plume writes a WAC ACL
+// on the per-post comment container granting:
+//   - owner: full Read/Write/Control (default for any owner-created ACL)
+//   - anyone (foaf:Agent): Read so visitors see the discussion
+//   - authenticated agents (acl:AuthenticatedAgent): Append so logged-in
+//     users can ADD new comments but can't modify/delete existing ones
+//
+// Disabling removes the ACL — the container falls back to its parent's
+// defaults (typically owner-only).
+
+const ACL_NS = 'http://www.w3.org/ns/auth/acl#'
+const FOAF_AGENT = 'http://xmlns.com/foaf/0.1/Agent'
+
+function aclUrlForCommentContainer(container) {
+  // JSS convention: <container>/.acl (inside the container)
+  return container + '.acl'
+}
+
+async function commentsEnabled(postUrl) {
+  const container = commentContainerForPost(postUrl)
+  if (!container) return false
+  try {
+    const r = await authFetch(aclUrlForCommentContainer(container), {
+      headers: { Accept: 'application/ld+json' }
+    })
+    if (!r.ok) return false
+    const doc = await r.json()
+    const nodes = doc['@graph']
+      ? (Array.isArray(doc['@graph']) ? doc['@graph'] : [doc['@graph']])
+      : [doc]
+    return nodes.some(n => {
+      const types = [].concat(n['@type'] || [])
+      if (!types.some(t => t === 'acl:Authorization' || t === ACL_NS + 'Authorization')) return false
+      const cls = []
+        .concat(n['acl:agentClass'] || [])
+        .concat(n[ACL_NS + 'agentClass'] || [])
+        .map(x => typeof x === 'string' ? x : x?.['@id'])
+        .filter(Boolean)
+      const hasAuthClass = cls.some(c =>
+        c === 'acl:AuthenticatedAgent' || c === ACL_NS + 'AuthenticatedAgent')
+      if (!hasAuthClass) return false
+      const modes = []
+        .concat(n['acl:mode'] || [])
+        .concat(n[ACL_NS + 'mode'] || [])
+        .map(x => typeof x === 'string' ? x : x?.['@id'])
+        .filter(Boolean)
+      return modes.some(m => m === 'acl:Append' || m === ACL_NS + 'Append' ||
+                              m === 'acl:Write'  || m === ACL_NS + 'Write')
+    })
+  } catch { return false }
+}
+
+async function enableComments(postUrl) {
+  if (!meWebId()) throw new Error('login required')
+  const container = commentContainerForPost(postUrl)
+  if (!container) throw new Error('invalid post URL')
+  // Make sure the container exists before setting its ACL
+  await ensureContainer(container)
+  const aclUrl = aclUrlForCommentContainer(container)
+  const acl = {
+    '@context': { acl: ACL_NS },
+    '@graph': [
+      {
+        '@id': '#owner',
+        '@type': 'acl:Authorization',
+        'acl:accessTo': { '@id': container },
+        'acl:default': { '@id': container },
+        'acl:agent': { '@id': meWebId() },
+        'acl:mode': [
+          { '@id': 'acl:Read' },
+          { '@id': 'acl:Write' },
+          { '@id': 'acl:Control' }
+        ]
+      },
+      {
+        '@id': '#anon-read',
+        '@type': 'acl:Authorization',
+        'acl:accessTo': { '@id': container },
+        'acl:default': { '@id': container },
+        'acl:agentClass': { '@id': FOAF_AGENT },
+        'acl:mode': [{ '@id': 'acl:Read' }]
+      },
+      {
+        '@id': '#auth-append',
+        '@type': 'acl:Authorization',
+        'acl:accessTo': { '@id': container },
+        'acl:default': { '@id': container },
+        'acl:agentClass': { '@id': ACL_NS + 'AuthenticatedAgent' },
+        'acl:mode': [{ '@id': 'acl:Append' }]
+      }
+    ]
+  }
+  const r = await authFetch(aclUrl, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/ld+json' },
+    body: JSON.stringify(acl, null, 2)
+  })
+  await throwOnHttpError(r, 'enable comments')
+}
+
+async function disableComments(postUrl) {
+  if (!meWebId()) throw new Error('login required')
+  const container = commentContainerForPost(postUrl)
+  if (!container) throw new Error('invalid post URL')
+  const r = await authFetch(aclUrlForCommentContainer(container), { method: 'DELETE' })
+  if (!r.ok && r.status !== 404) await throwOnHttpError(r, 'disable comments')
+}
+
+async function ensureContainer(url) {
+  const h = await authFetch(url, { method: 'HEAD' })
+  if (h.ok) return
+  if (h.status !== 404) throw new Error(`HEAD ${url}: ${h.status}`)
+  const parent = url.replace(/[^\/]+\/?$/, '')
+  const slug = url.split('/').filter(Boolean).pop()
+  const c = await authFetch(parent, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'text/turtle',
+      'Slug': slug,
+      'Link': '<http://www.w3.org/ns/ldp#BasicContainer>; rel="type"'
+    },
+    body: ''
+  })
+  if (!c.ok) throw new Error(`create ${url}: ${c.status}`)
+}
+
 async function throwOnHttpError(r, action) {
   if (r.ok) return
   let detail = ''
@@ -571,6 +699,7 @@ function renderPost(post) {
         <div class="post-actions">
           <a class="text-btn" id="post-source" target="_blank" rel="noopener noreferrer" title="Open the JSON-LD resource">View source</a>
           ${isMine ? `
+            <button class="text-btn" id="post-comments-toggle" title="Allow others to comment on this post">Comments: …</button>
             <button class="text-btn" id="post-edit">Edit</button>
             <button class="text-btn danger" id="post-delete">Delete</button>
           ` : ''}
@@ -598,6 +727,33 @@ function renderPost(post) {
         goHome()
       } catch (e) {
         showToast(e.message, null, 6000)
+      }
+    })
+    // Comments toggle — initially fetch status, then bind click to flip it
+    const togBtn = page.querySelector('#post-comments-toggle')
+    let enabled = false
+    commentsEnabled(post.url).then(e => {
+      enabled = e
+      togBtn.textContent = enabled ? 'Comments: on' : 'Comments: off'
+    })
+    togBtn.addEventListener('click', async () => {
+      const next = !enabled
+      togBtn.disabled = true
+      togBtn.textContent = next ? 'Enabling…' : 'Disabling…'
+      try {
+        if (next) await enableComments(post.url)
+        else await disableComments(post.url)
+        enabled = next
+        togBtn.textContent = enabled ? 'Comments: on' : 'Comments: off'
+        showToast(enabled
+          ? 'Comments enabled — anyone logged in can now comment.'
+          : 'Comments disabled.',
+          null, 3500)
+      } catch (e) {
+        togBtn.textContent = enabled ? 'Comments: on' : 'Comments: off'
+        showToast(e.message, null, 6000)
+      } finally {
+        togBtn.disabled = false
       }
     })
   }
@@ -931,7 +1087,9 @@ function watchLogin() {
       last = now
       renderIdentity()
       // Re-render current view to surface logged-in affordances
+      // (compose button, Edit/Delete, comment form, "Enable comments").
       if (state.view === 'home') renderHome()
+      else if (state.view === 'post' && state.currentPost) renderPost(state.currentPost)
       // When login state changes, the right pod target may have changed
       // too. If the user is now logged in and their WebID-derived pod
       // differs from what we were defaulting to (e.g. localhost from the
