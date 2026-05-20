@@ -1078,21 +1078,33 @@ function renderCompose(existing) {
   state.view = 'compose'
   state.currentPost = existing || null
   const page = document.getElementById('page')
+  const previewOn = (() => {
+    try { return localStorage.getItem('plume.preview') === '1' } catch { return false }
+  })()
   page.innerHTML = `
-    <div class="compose">
+    <div class="compose ${previewOn ? 'compose-split' : ''}" id="compose-root">
       <a class="post-back" href="?">Cancel</a>
       <input class="compose-title" id="c-title" placeholder="Title" autocomplete="off" />
       <input class="compose-tags" id="c-tags" placeholder="Tags (comma-separated, optional)" autocomplete="off" />
-      <textarea class="compose-body" id="c-body" placeholder="Write your post… markdown welcome."></textarea>
+      <div class="compose-grid">
+        <textarea class="compose-body" id="c-body" placeholder="Write your post… markdown welcome."></textarea>
+        <div class="compose-preview" id="c-preview" aria-label="Live preview">
+          <p class="compose-preview-empty">Preview appears here as you type.</p>
+        </div>
+      </div>
       <div class="compose-bar">
         <span class="compose-hint">${existing ? '⌘ + Enter to save' : '⌘ + Enter to publish'}</span>
+        <button class="text-btn" id="c-preview-toggle" title="Toggle live preview (⌘ + P)">${previewOn ? 'Hide preview' : 'Preview'}</button>
         <button class="btn-primary" id="c-publish" disabled>${existing ? 'Save' : 'Publish'}</button>
       </div>
     </div>
   `
+  const root = document.getElementById('compose-root')
   const titleEl = document.getElementById('c-title')
   const tagsEl = document.getElementById('c-tags')
   const bodyEl = document.getElementById('c-body')
+  const previewEl = document.getElementById('c-preview')
+  const previewBtn = document.getElementById('c-preview-toggle')
   const pubBtn = document.getElementById('c-publish')
   if (existing) {
     titleEl.value = existing.headline
@@ -1106,13 +1118,34 @@ function renderCompose(existing) {
     bodyEl.style.height = 'auto'
     bodyEl.style.height = Math.max(bodyEl.scrollHeight, window.innerHeight * 0.6) + 'px'
   }
+  const renderPreview = () => {
+    if (!root.classList.contains('compose-split')) return
+    const body = bodyEl.value
+    if (!body.trim()) {
+      previewEl.innerHTML = '<p class="compose-preview-empty">Preview appears here as you type.</p>'
+      return
+    }
+    previewEl.innerHTML = renderMarkdown(body)
+  }
+  const setPreview = (on) => {
+    root.classList.toggle('compose-split', on)
+    previewBtn.textContent = on ? 'Hide preview' : 'Preview'
+    try { localStorage.setItem('plume.preview', on ? '1' : '0') } catch {}
+    if (on) renderPreview()
+  }
   titleEl.addEventListener('input', refresh)
   tagsEl.addEventListener('input', refresh)
-  bodyEl.addEventListener('input', () => { refresh(); autosize() })
+  bodyEl.addEventListener('input', () => { refresh(); autosize(); renderPreview() })
+  previewBtn.addEventListener('click', () => setPreview(!root.classList.contains('compose-split')))
   ;[titleEl, tagsEl, bodyEl].forEach(el => el.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); publish() }
+    if (e.key === 'p' && (e.metaKey || e.ctrlKey)) {
+      e.preventDefault()
+      setPreview(!root.classList.contains('compose-split'))
+    }
   }))
   pubBtn.addEventListener('click', publish)
+  if (previewOn) renderPreview()
   page.querySelector('.post-back').addEventListener('click', (e) => {
     e.preventDefault()
     if (titleEl.value.trim() || bodyEl.value.trim()) {
