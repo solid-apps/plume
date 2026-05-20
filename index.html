@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>plume</title>
+  <link rel="icon" type="image/svg+xml" href="favicon.svg">
+  <link rel="stylesheet" href="style.css">
+  <script src="https://unpkg.com/xlogin@0.0.12"></script>
+  <script src="https://unpkg.com/marked@12.0.0/marked.min.js"></script>
+</head>
+<body>
+
+  <header class="masthead">
+    <div class="masthead-inner">
+      <a class="brand" href="?" id="brand">
+        <span class="brand-mark">𓂃</span>
+        <span class="brand-name">plume</span>
+      </a>
+      <span class="brand-tag" id="blog-tagline">light as a feather</span>
+      <nav class="masthead-nav">
+        <button class="ghost-btn" id="btn-new" hidden>+ Write</button>
+        <span class="topbar-id" id="topbar-id" hidden></span>
+      </nav>
+    </div>
+  </header>
+
+  <main class="page" id="page">
+    <div class="loading" id="loading">
+      <span class="dot"></span>
+      <span class="dot"></span>
+      <span class="dot"></span>
+    </div>
+  </main>
+
+  <footer class="footer">
+    <div class="footer-inner">
+      <span>Posts live on <a id="footer-pod" href="#"></a> as JSON-LD</span>
+      <span class="footer-sep">·</span>
+      <span><a href="https://github.com/solid-apps/plume" target="_blank" rel="noopener">solid-apps/plume</a></span>
+    </div>
+  </footer>
+
+  <div class="toast" id="toast" hidden>
+    <span class="toast-msg" id="toast-msg"></span>
+    <button class="toast-close" id="toast-close" title="Dismiss">×</button>
+  </div>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>
