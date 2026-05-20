@@ -59,9 +59,13 @@ function escapeHtml(s) {
 function renderMarkdown(md) {
   if (window.marked) {
     try {
-      // marked.parse with default options — produces clean HTML.
       window.marked.use({ breaks: false, gfm: true });
-      return window.marked.parse(md || '')
+      let html = window.marked.parse(md || '')
+      // External links: open in a new tab. Skip in-document fragment refs
+      // (#foo) so a footnote/anchor link inside the post stays in-page.
+      html = html.replace(/<a (?![^>]*\btarget=)([^>]*?)href="([^"#][^"]*)"/g,
+        '<a target="_blank" rel="noopener noreferrer" $1href="$2"')
+      return html
     } catch (e) {
       console.warn('marked threw:', e)
     }
@@ -273,13 +277,17 @@ function parsePost(doc, url) {
     (node['schema:author'] && (node['schema:author']['@id'] || node['schema:author'])) ||
     (node[SCHEMA + 'author'] && (node[SCHEMA + 'author']['@id'] || node[SCHEMA + 'author'])) ||
     node['author'] || null
+  const modified =
+    node['schema:dateModified'] || node[SCHEMA + 'dateModified'] ||
+    node['dateModified'] || null
   if (!headline || !body) return null
   return {
     url,
     headline: String(headline),
     body: String(body),
     author: typeof author === 'string' ? author : author?.['@id'] || null,
-    dateCreated: new Date(created || Date.now())
+    dateCreated: new Date(created || Date.now()),
+    dateModified: modified ? new Date(modified) : null
   }
 }
 
@@ -304,22 +312,69 @@ async function savePost({ headline, body, slug }) {
     headers: { 'Content-Type': 'application/ld+json' },
     body: JSON.stringify(doc, null, 2)
   })
-  if (!r.ok) {
-    let detail = ''
-    try {
-      const text = (await r.text()).slice(0, 240)
-      try { detail = JSON.parse(text).message || text } catch { detail = text }
-    } catch {}
-    if (r.status === 413) detail = 'post too large for server'
-    else if (r.status === 401 || r.status === 403) detail = 'forbidden — check login + ACL'
-    throw new Error(`HTTP ${r.status}${detail ? ' — ' + detail : ''}`)
-  }
+  await throwOnHttpError(r, 'publish')
   const local = parsePost(doc, url)
   if (local) {
     state.posts.unshift(local)
     state.byUrl.set(local.url, local)
   }
   return url
+}
+
+// Update existing post — preserves the original URL, datePublished, author;
+// updates headline + articleBody and stamps schema:dateModified.
+async function updatePost(url, { headline, body }) {
+  if (!meWebId()) throw new Error('login required to edit')
+  const existing = state.byUrl.get(url) || await fetchPost(url)
+  if (!existing) throw new Error('post not found')
+  if (existing.author && existing.author !== meWebId()) {
+    throw new Error('this post belongs to a different author')
+  }
+  const doc = {
+    '@context': { schema: SCHEMA },
+    '@id': '',
+    '@type': 'schema:BlogPosting',
+    'schema:headline': headline,
+    'schema:articleBody': body,
+    'schema:datePublished': existing.dateCreated.toISOString(),
+    'schema:dateModified': new Date().toISOString(),
+    'schema:author': { '@id': existing.author || meWebId() }
+  }
+  const r = await authFetch(url, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/ld+json' },
+    body: JSON.stringify(doc, null, 2)
+  })
+  await throwOnHttpError(r, 'save')
+  const local = parsePost(doc, url)
+  if (local) {
+    // Replace in posts list (keep ordering by dateCreated)
+    state.posts = state.posts.map(p => p.url === url ? local : p)
+    state.byUrl.set(url, local)
+  }
+  return url
+}
+
+async function deletePost(url) {
+  if (!meWebId()) throw new Error('login required to delete')
+  const r = await authFetch(url, { method: 'DELETE' })
+  if (!r.ok && r.status !== 404) {
+    await throwOnHttpError(r, 'delete')
+  }
+  state.posts = state.posts.filter(p => p.url !== url)
+  state.byUrl.delete(url)
+}
+
+async function throwOnHttpError(r, action) {
+  if (r.ok) return
+  let detail = ''
+  try {
+    const text = (await r.text()).slice(0, 240)
+    try { detail = JSON.parse(text).message || text } catch { detail = text }
+  } catch {}
+  if (r.status === 413) detail = 'too large for server'
+  else if (r.status === 401 || r.status === 403) detail = 'forbidden — check login + ACL'
+  throw new Error(`Couldn't ${action}: HTTP ${r.status}${detail ? ' — ' + detail : ''}`)
 }
 
 // --- rendering ---
@@ -392,8 +447,8 @@ function renderPost(post) {
         </div>
         ${isMine ? `
           <div class="post-actions">
-            <button class="text-btn" id="post-edit" disabled title="Phase 2 — coming soon">Edit</button>
-            <button class="text-btn danger" id="post-delete" disabled title="Phase 2 — coming soon">Delete</button>
+            <button class="text-btn" id="post-edit">Edit</button>
+            <button class="text-btn danger" id="post-delete">Delete</button>
           </div>` : ''}
       </header>
       <div class="post-body"></div>
@@ -407,6 +462,24 @@ function renderPost(post) {
     e.preventDefault()
     goHome()
   })
+  if (isMine) {
+    page.querySelector('#post-edit').addEventListener('click', () => goEdit(post.url))
+    page.querySelector('#post-delete').addEventListener('click', async () => {
+      if (!confirm(`Delete "${post.headline}"? This can't be undone.`)) return
+      try {
+        await deletePost(post.url)
+        showToast('Post deleted.', null, 2400)
+        goHome()
+      } catch (e) {
+        showToast(e.message, null, 6000)
+      }
+    })
+  }
+  // Show "(edited)" indicator when the post has been updated
+  if (post.dateModified) {
+    const dateEl = page.querySelector('.post-author-date')
+    dateEl.innerHTML = `${formatDate(post.dateCreated)} <span style="opacity:0.7">· edited ${formatDate(post.dateModified)}</span>`
+  }
 }
 
 function renderCompose(existing) {
@@ -419,8 +492,8 @@ function renderCompose(existing) {
       <input class="compose-title" id="c-title" placeholder="Title" autocomplete="off" />
       <textarea class="compose-body" id="c-body" placeholder="Write your post… markdown welcome."></textarea>
       <div class="compose-bar">
-        <span class="compose-hint">⌘ + Enter to publish</span>
-        <button class="btn-primary" id="c-publish" disabled>Publish</button>
+        <span class="compose-hint">${existing ? '⌘ + Enter to save' : '⌘ + Enter to publish'}</span>
+        <button class="btn-primary" id="c-publish" disabled>${existing ? 'Save' : 'Publish'}</button>
       </div>
     </div>
   `
@@ -456,19 +529,25 @@ function renderCompose(existing) {
 
   async function publish() {
     if (pubBtn.disabled) return
+    const isEdit = !!existing
     pubBtn.disabled = true
-    pubBtn.textContent = 'Publishing…'
+    pubBtn.textContent = isEdit ? 'Saving…' : 'Publishing…'
     try {
-      const url = await savePost({
-        headline: titleEl.value.trim(),
-        body: bodyEl.value
-      })
-      showToast('Published.', null, 2200)
+      const url = isEdit
+        ? await updatePost(existing.url, {
+            headline: titleEl.value.trim(),
+            body: bodyEl.value
+          })
+        : await savePost({
+            headline: titleEl.value.trim(),
+            body: bodyEl.value
+          })
+      showToast(isEdit ? 'Saved.' : 'Published.', null, 2200)
       goPost(url)
     } catch (e) {
-      showToast(`Couldn't publish: ${e.message}`, null, 6000)
+      showToast(e.message, null, 6000)
       pubBtn.disabled = false
-      pubBtn.textContent = 'Publish'
+      pubBtn.textContent = isEdit ? 'Save' : 'Publish'
     }
   }
 }
@@ -497,6 +576,8 @@ async function fillAuthor(avEl, nameEl, webId, size) {
 function readRoute() {
   const u = new URL(location.href)
   if (u.searchParams.has('new')) return { view: 'compose' }
+  const edit = u.searchParams.get('edit')
+  if (edit) return { view: 'edit', url: edit }
   const post = u.searchParams.get('post')
   if (post) return { view: 'post', url: post }
   return { view: 'home' }
@@ -525,6 +606,18 @@ function goCompose(existing) {
   history.pushState(null, '', '?new')
   renderCompose(existing)
 }
+function goEdit(url) {
+  const u = new URL(location.href)
+  u.search = '?edit=' + encodeURIComponent(url)
+  u.hash = ''
+  history.pushState(null, '', u.toString())
+  const post = state.byUrl.get(url)
+  if (post) renderCompose(post)
+  else fetchPost(url).then(p => {
+    if (p) { state.byUrl.set(url, p); renderCompose(p) }
+    else { showToast('Post not found.', null, 4000); goHome() }
+  })
+}
 
 window.addEventListener('popstate', () => {
   applyRoute()
@@ -535,6 +628,14 @@ function applyRoute() {
   if (route.view === 'compose') {
     if (!meWebId()) { showToast('Log in to write.', null, 3000); renderHome(); return }
     renderCompose()
+  } else if (route.view === 'edit' && route.url) {
+    if (!meWebId()) { showToast('Log in to edit.', null, 3000); renderHome(); return }
+    const post = state.byUrl.get(route.url)
+    if (post) renderCompose(post)
+    else fetchPost(route.url).then(p => {
+      if (p) { state.byUrl.set(route.url, p); renderCompose(p) }
+      else { showToast('Post not found.', null, 4000); renderHome() }
+    })
   } else if (route.view === 'post' && route.url) {
     const post = state.byUrl.get(route.url)
     if (post) renderPost(post)
