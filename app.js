@@ -28,6 +28,7 @@ const state = {
   // current view: 'home' | 'post' | 'compose'
   view: 'home',
   currentPost: null,
+  currentTag: null,
   // Blog identity — derived from the pod owner's WebID profile when we
   // know who owns this pod. Drives the masthead so /?pod=alice.pod and
   // /?pod=bob.pod feel like genuinely different blogs.
@@ -281,6 +282,10 @@ function parsePost(doc, url) {
   const modified =
     node['schema:dateModified'] || node[SCHEMA + 'dateModified'] ||
     node['dateModified'] || null
+  const rawKeywords =
+    node['schema:keywords'] || node[SCHEMA + 'keywords'] ||
+    node['keywords'] || []
+  const keywords = normaliseKeywords(rawKeywords)
   if (!headline || !body) return null
   return {
     url,
@@ -288,17 +293,39 @@ function parsePost(doc, url) {
     body: String(body),
     author: typeof author === 'string' ? author : author?.['@id'] || null,
     dateCreated: new Date(created || Date.now()),
-    dateModified: modified ? new Date(modified) : null
+    dateModified: modified ? new Date(modified) : null,
+    keywords
   }
 }
 
-async function savePost({ headline, body, slug }) {
+// Tags can be serialised three ways: a single string ("a, b, c"), an
+// array of strings, or absent. Normalise to a clean string[] of unique
+// lower-cased tags with whitespace stripped.
+function normaliseKeywords(raw) {
+  let arr
+  if (Array.isArray(raw)) arr = raw
+  else if (typeof raw === 'string') arr = raw.split(',')
+  else return []
+  const seen = new Set()
+  const out = []
+  for (const v of arr) {
+    const t = String(v).trim().toLowerCase()
+    if (!t) continue
+    if (seen.has(t)) continue
+    seen.add(t)
+    out.push(t)
+  }
+  return out
+}
+
+async function savePost({ headline, body, slug, keywords }) {
   if (!meWebId()) throw new Error('login required to publish')
   await ensureBlog().catch(() => {})
   const ts = Date.now()
   const finalSlug = slug || `${slugify(headline)}-${ts.toString(36)}`
   const filename = `${finalSlug}.jsonld`
   const url = state.blogUrl + filename
+  const tags = normaliseKeywords(keywords || [])
   const doc = {
     '@context': { schema: SCHEMA },
     '@id': '',
@@ -308,6 +335,7 @@ async function savePost({ headline, body, slug }) {
     'schema:datePublished': new Date(ts).toISOString(),
     'schema:author': { '@id': meWebId() }
   }
+  if (tags.length) doc['schema:keywords'] = tags
   const r = await authFetch(url, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/ld+json' },
@@ -323,14 +351,15 @@ async function savePost({ headline, body, slug }) {
 }
 
 // Update existing post — preserves the original URL, datePublished, author;
-// updates headline + articleBody and stamps schema:dateModified.
-async function updatePost(url, { headline, body }) {
+// updates headline + articleBody + keywords and stamps schema:dateModified.
+async function updatePost(url, { headline, body, keywords }) {
   if (!meWebId()) throw new Error('login required to edit')
   const existing = state.byUrl.get(url) || await fetchPost(url)
   if (!existing) throw new Error('post not found')
   if (existing.author && existing.author !== meWebId()) {
     throw new Error('this post belongs to a different author')
   }
+  const tags = normaliseKeywords(keywords || [])
   const doc = {
     '@context': { schema: SCHEMA },
     '@id': '',
@@ -341,6 +370,7 @@ async function updatePost(url, { headline, body }) {
     'schema:dateModified': new Date().toISOString(),
     'schema:author': { '@id': existing.author || meWebId() }
   }
+  if (tags.length) doc['schema:keywords'] = tags
   const r = await authFetch(url, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/ld+json' },
@@ -630,9 +660,13 @@ async function throwOnHttpError(r, action) {
 
 // --- rendering ---
 
-function renderHome() {
+function renderHome(tag) {
   state.view = 'home'
+  state.currentTag = tag || null
   const page = document.getElementById('page')
+  const filtered = tag
+    ? state.posts.filter(p => (p.keywords || []).includes(tag))
+    : state.posts
   if (state.posts.length === 0) {
     const loggedIn = !!meWebId()
     const host = (() => { try { return new URL(state.blogUrl || '').host } catch { return 'this pod' } })()
@@ -649,9 +683,25 @@ function renderHome() {
     }
     return
   }
-  page.innerHTML = `<div class="home" id="home-list"></div>`
+  const header = tag
+    ? `<div class="home-filter">
+         <span class="home-filter-label">Posts tagged</span>
+         <span class="tag-chip tag-chip-active">#${escapeHtml(tag)}</span>
+         <a class="home-filter-clear" href="?">Clear ×</a>
+       </div>`
+    : ''
+  page.innerHTML = `
+    ${header}
+    <div class="home" id="home-list"></div>
+  `
+  const clearLink = page.querySelector('.home-filter-clear')
+  if (clearLink) clearLink.addEventListener('click', (e) => { e.preventDefault(); goHome() })
   const list = document.getElementById('home-list')
-  state.posts.forEach(p => list.appendChild(renderPostCard(p)))
+  if (filtered.length === 0) {
+    list.innerHTML = `<p class="home-empty-tag">No posts tagged <strong>#${escapeHtml(tag)}</strong> yet.</p>`
+    return
+  }
+  filtered.forEach(p => list.appendChild(renderPostCard(p)))
 }
 
 function renderPostCard(post) {
@@ -666,16 +716,33 @@ function renderPostCard(post) {
       <span class="post-card-sep">·</span>
       <span class="post-card-date"></span>
     </div>
+    <div class="post-card-tags"></div>
   `
   card.querySelector('.post-card-title').textContent = post.headline
   card.querySelector('.post-card-excerpt').textContent = excerpt(post.body)
   card.querySelector('.post-card-date').textContent = formatDate(post.dateCreated)
   fillAuthor(card.querySelector('.post-card-avatar'), card.querySelector('.post-card-author'), post.author)
+  renderTagChips(card.querySelector('.post-card-tags'), post.keywords)
   card.addEventListener('click', (e) => {
-    if (e.target.closest('a')) return
+    if (e.target.closest('a, .tag-chip')) return
     goPost(post.url)
   })
   return card
+}
+
+function renderTagChips(container, keywords) {
+  if (!container) return
+  const tags = keywords || []
+  if (!tags.length) { container.remove(); return }
+  container.innerHTML = ''
+  tags.forEach(t => {
+    const chip = document.createElement('a')
+    chip.className = 'tag-chip'
+    chip.href = '?tag=' + encodeURIComponent(t)
+    chip.textContent = '#' + t
+    chip.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); goTag(t) })
+    container.appendChild(chip)
+  })
 }
 
 function renderPost(post) {
@@ -705,11 +772,13 @@ function renderPost(post) {
           ` : ''}
         </div>
       </header>
+      <div class="post-tags"></div>
       <div class="post-body"></div>
     </article>
   `
   page.querySelector('.post-title').textContent = post.headline
   page.querySelector('.post-author-date').textContent = formatDate(post.dateCreated)
+  renderTagChips(page.querySelector('.post-tags'), post.keywords)
   page.querySelector('.post-body').innerHTML = renderMarkdown(post.body)
   fillAuthor(page.querySelector('.post-author-avatar'), page.querySelector('.post-author-name'), post.author, 'big')
   page.querySelector('.post-back').addEventListener('click', (e) => {
@@ -902,6 +971,7 @@ function renderCompose(existing) {
     <div class="compose">
       <a class="post-back" href="?">Cancel</a>
       <input class="compose-title" id="c-title" placeholder="Title" autocomplete="off" />
+      <input class="compose-tags" id="c-tags" placeholder="Tags (comma-separated, optional)" autocomplete="off" />
       <textarea class="compose-body" id="c-body" placeholder="Write your post… markdown welcome."></textarea>
       <div class="compose-bar">
         <span class="compose-hint">${existing ? '⌘ + Enter to save' : '⌘ + Enter to publish'}</span>
@@ -910,10 +980,12 @@ function renderCompose(existing) {
     </div>
   `
   const titleEl = document.getElementById('c-title')
+  const tagsEl = document.getElementById('c-tags')
   const bodyEl = document.getElementById('c-body')
   const pubBtn = document.getElementById('c-publish')
   if (existing) {
     titleEl.value = existing.headline
+    tagsEl.value = (existing.keywords || []).join(', ')
     bodyEl.value = existing.body
   }
   const refresh = () => {
@@ -924,8 +996,9 @@ function renderCompose(existing) {
     bodyEl.style.height = Math.max(bodyEl.scrollHeight, window.innerHeight * 0.6) + 'px'
   }
   titleEl.addEventListener('input', refresh)
+  tagsEl.addEventListener('input', refresh)
   bodyEl.addEventListener('input', () => { refresh(); autosize() })
-  ;[titleEl, bodyEl].forEach(el => el.addEventListener('keydown', (e) => {
+  ;[titleEl, tagsEl, bodyEl].forEach(el => el.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); publish() }
   }))
   pubBtn.addEventListener('click', publish)
@@ -945,14 +1018,17 @@ function renderCompose(existing) {
     pubBtn.disabled = true
     pubBtn.textContent = isEdit ? 'Saving…' : 'Publishing…'
     try {
+      const keywords = tagsEl.value.split(',')
       const url = isEdit
         ? await updatePost(existing.url, {
             headline: titleEl.value.trim(),
-            body: bodyEl.value
+            body: bodyEl.value,
+            keywords
           })
         : await savePost({
             headline: titleEl.value.trim(),
-            body: bodyEl.value
+            body: bodyEl.value,
+            keywords
           })
       showToast(isEdit ? 'Saved.' : 'Published.', null, 2200)
       goPost(url)
@@ -992,12 +1068,23 @@ function readRoute() {
   if (edit) return { view: 'edit', url: edit }
   const post = u.searchParams.get('post')
   if (post) return { view: 'post', url: post }
+  const tag = u.searchParams.get('tag')
+  if (tag) return { view: 'home', tag: tag.toLowerCase().trim() }
   return { view: 'home' }
 }
 
 function goHome() {
   history.pushState(null, '', location.pathname)
   renderHome()
+}
+function goTag(tag) {
+  const t = String(tag || '').toLowerCase().trim()
+  if (!t) { goHome(); return }
+  const u = new URL(location.href)
+  u.search = '?tag=' + encodeURIComponent(t)
+  u.hash = ''
+  history.pushState(null, '', u.toString())
+  renderHome(t)
 }
 function goPost(url) {
   const u = new URL(location.href)
@@ -1055,6 +1142,8 @@ function applyRoute() {
       if (p) { state.byUrl.set(route.url, p); renderPost(p) }
       else { showToast('Post not found.', null, 4000); renderHome() }
     })
+  } else if (route.tag) {
+    renderHome(route.tag)
   } else {
     renderHome()
   }
@@ -1088,7 +1177,7 @@ function watchLogin() {
       renderIdentity()
       // Re-render current view to surface logged-in affordances
       // (compose button, Edit/Delete, comment form, "Enable comments").
-      if (state.view === 'home') renderHome()
+      if (state.view === 'home') renderHome(state.currentTag || undefined)
       else if (state.view === 'post' && state.currentPost) renderPost(state.currentPost)
       // When login state changes, the right pod target may have changed
       // too. If the user is now logged in and their WebID-derived pod
