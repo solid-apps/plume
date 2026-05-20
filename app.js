@@ -14,6 +14,7 @@
 //   8. Mashlib pane integration
 
 const POST_PATH = '/public/post/'
+const COMMENT_PATH = '/public/comment/'
 const LS_LAST_POD = 'plume.lastPod'
 const SCHEMA = 'https://schema.org/'
 const FOAF = 'http://xmlns.com/foaf/0.1/'
@@ -365,6 +366,128 @@ async function deletePost(url) {
   state.byUrl.delete(url)
 }
 
+// --- comments ---
+//
+// Each post gets a sibling container at <pod>/public/comment/<post-slug>/.
+// Comments are schema:Comment JSON-LD resources with schema:about pointing
+// at the post URL. Author allows comments by granting ACL write access on
+// /public/comment/<post-slug>/ — without that, the form 403s and we say so.
+
+function commentContainerForPost(postUrl) {
+  try {
+    const u = new URL(postUrl)
+    const filename = u.pathname.split('/').pop() || ''
+    const slug = filename.replace(/\.jsonld$/, '')
+    if (!slug) return null
+    return `${u.origin}${COMMENT_PATH}${slug}/`
+  } catch { return null }
+}
+
+async function loadComments(postUrl) {
+  const container = commentContainerForPost(postUrl)
+  if (!container) return []
+  const r = await authFetch(container, { headers: { Accept: 'application/ld+json' } })
+  if (!r.ok) {
+    if (r.status === 404 || r.status === 401 || r.status === 403) return []
+    throw new Error(`load comments: ${r.status}`)
+  }
+  const doc = await r.json()
+  const contains = doc['ldp:contains'] || doc['http://www.w3.org/ns/ldp#contains'] || doc['contains'] || []
+  const arr = Array.isArray(contains) ? contains : [contains]
+  const urls = arr
+    .map(x => typeof x === 'string' ? x : x['@id'])
+    .filter(Boolean)
+    .filter(u => u.endsWith('.jsonld'))
+  const comments = await Promise.all(urls.map(fetchComment))
+  return comments
+    .filter(Boolean)
+    .sort((a, b) => a.dateCreated - b.dateCreated)
+}
+
+async function fetchComment(url) {
+  try {
+    const r = await authFetch(url, { headers: { Accept: 'application/ld+json' } })
+    if (!r.ok) return null
+    const doc = await r.json()
+    return parseComment(doc, url)
+  } catch { return null }
+}
+
+function parseComment(doc, url) {
+  const node = doc['@graph']
+    ? (Array.isArray(doc['@graph']) ? doc['@graph'][0] : doc['@graph'])
+    : doc
+  if (!node) return null
+  const text =
+    node['schema:text'] || node[SCHEMA + 'text'] || node['text'] || ''
+  const created =
+    node['schema:dateCreated'] || node[SCHEMA + 'dateCreated'] ||
+    node['dateCreated'] || null
+  const author =
+    (node['schema:author'] && (node['schema:author']['@id'] || node['schema:author'])) ||
+    (node[SCHEMA + 'author'] && (node[SCHEMA + 'author']['@id'] || node[SCHEMA + 'author'])) ||
+    node['author'] || null
+  if (!text || !created) return null
+  return {
+    url,
+    text: String(text),
+    author: typeof author === 'string' ? author : author?.['@id'] || null,
+    dateCreated: new Date(created)
+  }
+}
+
+async function postComment(postUrl, text) {
+  if (!meWebId()) throw new Error('login required to comment')
+  const container = commentContainerForPost(postUrl)
+  if (!container) throw new Error('invalid post URL')
+  // Try to create the container — idempotent if it exists. The post
+  // author needs to have granted us write here; if not, we'll 403 on
+  // the PUT below and surface a clear message.
+  try {
+    const parent = container.replace(/[^\/]+\/?$/, '')
+    const slug = container.split('/').filter(Boolean).pop()
+    await authFetch(parent, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'text/turtle',
+        'Slug': slug,
+        'Link': '<http://www.w3.org/ns/ldp#BasicContainer>; rel="type"'
+      },
+      body: ''
+    })
+  } catch {}
+  const ts = Date.now()
+  const rand = Math.random().toString(36).slice(2, 8)
+  const url = `${container}${ts}-${rand}.jsonld`
+  const doc = {
+    '@context': { schema: SCHEMA },
+    '@id': '',
+    '@type': 'schema:Comment',
+    'schema:text': text,
+    'schema:dateCreated': new Date(ts).toISOString(),
+    'schema:author': { '@id': meWebId() },
+    'schema:about': { '@id': postUrl }
+  }
+  const r = await authFetch(url, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/ld+json' },
+    body: JSON.stringify(doc, null, 2)
+  })
+  if (!r.ok) {
+    if (r.status === 401 || r.status === 403) {
+      throw new Error("Couldn't post comment — the blog author hasn't granted write access on the comments container.")
+    }
+    await throwOnHttpError(r, 'comment')
+  }
+  return parseComment(doc, url)
+}
+
+async function deleteComment(url) {
+  if (!meWebId()) throw new Error('login required to delete')
+  const r = await authFetch(url, { method: 'DELETE' })
+  if (!r.ok && r.status !== 404) await throwOnHttpError(r, 'delete')
+}
+
 async function throwOnHttpError(r, action) {
   if (r.ok) return
   let detail = ''
@@ -483,6 +606,136 @@ function renderPost(post) {
     const dateEl = page.querySelector('.post-author-date')
     dateEl.innerHTML = `${formatDate(post.dateCreated)} <span style="opacity:0.7">· edited ${formatDate(post.dateModified)}</span>`
   }
+
+  // Comments section
+  renderCommentsSection(post)
+}
+
+function renderCommentsSection(post) {
+  const article = document.querySelector('.post')
+  if (!article) return
+  const section = document.createElement('section')
+  section.className = 'comments'
+  section.innerHTML = `
+    <h3 class="comments-heading">Discussion <span class="comments-count" id="comments-count"></span></h3>
+    <ol class="comments-list" id="comments-list">
+      <li class="comments-loading">Loading conversation…</li>
+    </ol>
+    ${meWebId() ? `
+      <form class="comment-form" id="comment-form">
+        <textarea class="comment-input" id="comment-input" placeholder="Add to the conversation…" rows="3"></textarea>
+        <div class="comment-form-bar">
+          <span class="comment-hint">⌘ + Enter to post</span>
+          <button class="btn-primary" id="comment-submit" type="submit" disabled>Comment</button>
+        </div>
+      </form>
+    ` : `
+      <p class="comments-login">Log in (top-right) to leave a comment.</p>
+    `}
+  `
+  article.appendChild(section)
+
+  // Load + render comments
+  loadComments(post.url)
+    .then(comments => renderCommentsList(comments, post))
+    .catch(e => {
+      const list = document.getElementById('comments-list')
+      if (list) list.innerHTML = `<li class="comments-empty">Couldn't load comments: ${escapeHtml(e.message)}</li>`
+    })
+
+  // Bind form
+  const form = document.getElementById('comment-form')
+  if (!form) return
+  const input = document.getElementById('comment-input')
+  const submit = document.getElementById('comment-submit')
+  const refresh = () => { submit.disabled = !input.value.trim() || !meWebId() }
+  input.addEventListener('input', refresh)
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); doSubmit() }
+  })
+  form.addEventListener('submit', (e) => { e.preventDefault(); doSubmit() })
+  refresh()
+
+  async function doSubmit() {
+    if (submit.disabled) return
+    submit.disabled = true
+    submit.textContent = 'Posting…'
+    try {
+      const c = await postComment(post.url, input.value.trim())
+      input.value = ''
+      // Append the new comment to the list (or remove the empty state)
+      const list = document.getElementById('comments-list')
+      const empty = list.querySelector('.comments-empty')
+      if (empty) empty.remove()
+      list.appendChild(renderCommentItem(c, post))
+      updateCommentsCount()
+    } catch (e) {
+      showToast(e.message, null, 7000)
+    } finally {
+      submit.disabled = false
+      submit.textContent = 'Comment'
+      refresh()
+    }
+  }
+}
+
+function updateCommentsCount() {
+  const list = document.getElementById('comments-list')
+  const count = document.getElementById('comments-count')
+  if (!list || !count) return
+  const n = list.querySelectorAll('.comment').length
+  count.textContent = n > 0 ? `· ${n}` : ''
+}
+
+function renderCommentsList(comments, post) {
+  const list = document.getElementById('comments-list')
+  if (!list) return
+  if (comments.length === 0) {
+    list.innerHTML = `<li class="comments-empty">No comments yet — start the conversation.</li>`
+    updateCommentsCount()
+    return
+  }
+  list.innerHTML = ''
+  comments.forEach(c => list.appendChild(renderCommentItem(c, post)))
+  updateCommentsCount()
+}
+
+function renderCommentItem(comment, post) {
+  const li = document.createElement('li')
+  li.className = 'comment'
+  li.dataset.url = comment.url
+  const isMine = comment.author === meWebId()
+  li.innerHTML = `
+    <span class="comment-avatar"></span>
+    <div class="comment-body">
+      <div class="comment-head">
+        <a class="comment-author" href="#" target="_blank" rel="noopener noreferrer"></a>
+        <span class="comment-date"></span>
+        ${isMine ? '<button class="text-btn comment-delete" title="Delete">×</button>' : ''}
+      </div>
+      <div class="comment-text"></div>
+    </div>
+  `
+  li.querySelector('.comment-text').textContent = comment.text
+  li.querySelector('.comment-date').textContent = formatDate(comment.dateCreated)
+  fillAuthor(li.querySelector('.comment-avatar'), li.querySelector('.comment-author'), comment.author)
+  if (isMine) {
+    li.querySelector('.comment-delete').addEventListener('click', async () => {
+      if (!confirm('Delete this comment?')) return
+      try {
+        await deleteComment(comment.url)
+        li.remove()
+        updateCommentsCount()
+        const list = document.getElementById('comments-list')
+        if (list && list.children.length === 0) {
+          list.innerHTML = `<li class="comments-empty">No comments yet — start the conversation.</li>`
+        }
+      } catch (e) {
+        showToast(e.message, null, 6000)
+      }
+    })
+  }
+  return li
 }
 
 function renderCompose(existing) {
