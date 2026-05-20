@@ -15,6 +15,7 @@
 
 const POST_PATH = '/public/post/'
 const COMMENT_PATH = '/public/comment/'
+const IMAGE_PATH = '/public/post-image/'
 const LS_LAST_POD = 'plume.lastPod'
 const SCHEMA = 'https://schema.org/'
 const FOAF = 'http://xmlns.com/foaf/0.1/'
@@ -232,6 +233,44 @@ async function ensureBlog() {
   if (!c.ok) throw new Error(`create blog: ${c.status}`)
 }
 
+// --- cover image uploads ---
+
+async function ensureImageContainer() {
+  const url = state.podOrigin + IMAGE_PATH
+  const r = await authFetch(url, { method: 'HEAD' })
+  if (r.ok) return
+  if (r.status !== 404) throw new Error(`HEAD ${url}: ${r.status}`)
+  const slug = IMAGE_PATH.split('/').filter(Boolean).pop()
+  const parent = state.podOrigin + '/public/'
+  const c = await authFetch(parent, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'text/turtle',
+      'Slug': slug,
+      'Link': '<http://www.w3.org/ns/ldp#BasicContainer>; rel="type"'
+    },
+    body: ''
+  })
+  if (!c.ok) throw new Error(`create image container: ${c.status}`)
+}
+
+async function uploadCoverImage(file) {
+  if (!meWebId()) throw new Error('login required to upload')
+  await ensureImageContainer()
+  const ts = Date.now()
+  const rand = Math.random().toString(36).slice(2, 8)
+  const extMatch = (file.name || '').match(/\.([a-z0-9]+)$/i)
+  const ext = (extMatch?.[1] || (file.type.split('/')[1] || 'bin')).toLowerCase()
+  const url = `${state.podOrigin}${IMAGE_PATH}${ts}-${rand}.${ext}`
+  const r = await authFetch(url, {
+    method: 'PUT',
+    headers: { 'Content-Type': file.type || 'application/octet-stream' },
+    body: file
+  })
+  await throwOnHttpError(r, 'upload image')
+  return url
+}
+
 async function loadPosts() {
   const r = await authFetch(state.blogUrl, { headers: { Accept: 'application/ld+json' } })
   if (!r.ok) {
@@ -286,6 +325,11 @@ function parsePost(doc, url) {
     node['schema:keywords'] || node[SCHEMA + 'keywords'] ||
     node['keywords'] || []
   const keywords = normaliseKeywords(rawKeywords)
+  const rawImage =
+    node['schema:image'] || node[SCHEMA + 'image'] || node['image'] || null
+  const image = typeof rawImage === 'string'
+    ? rawImage
+    : (rawImage && (rawImage['@id'] || rawImage.url)) || null
   if (!headline || !body) return null
   return {
     url,
@@ -294,7 +338,8 @@ function parsePost(doc, url) {
     author: typeof author === 'string' ? author : author?.['@id'] || null,
     dateCreated: new Date(created || Date.now()),
     dateModified: modified ? new Date(modified) : null,
-    keywords
+    keywords,
+    image
   }
 }
 
@@ -318,7 +363,7 @@ function normaliseKeywords(raw) {
   return out
 }
 
-async function savePost({ headline, body, slug, keywords }) {
+async function savePost({ headline, body, slug, keywords, image }) {
   if (!meWebId()) throw new Error('login required to publish')
   await ensureBlog().catch(() => {})
   const ts = Date.now()
@@ -336,6 +381,7 @@ async function savePost({ headline, body, slug, keywords }) {
     'schema:author': { '@id': meWebId() }
   }
   if (tags.length) doc['schema:keywords'] = tags
+  if (image) doc['schema:image'] = { '@id': image }
   const r = await authFetch(url, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/ld+json' },
@@ -353,7 +399,7 @@ async function savePost({ headline, body, slug, keywords }) {
 
 // Update existing post — preserves the original URL, datePublished, author;
 // updates headline + articleBody + keywords and stamps schema:dateModified.
-async function updatePost(url, { headline, body, keywords }) {
+async function updatePost(url, { headline, body, keywords, image }) {
   if (!meWebId()) throw new Error('login required to edit')
   const existing = state.byUrl.get(url) || await fetchPost(url)
   if (!existing) throw new Error('post not found')
@@ -372,6 +418,7 @@ async function updatePost(url, { headline, body, keywords }) {
     'schema:author': { '@id': existing.author || meWebId() }
   }
   if (tags.length) doc['schema:keywords'] = tags
+  if (image) doc['schema:image'] = { '@id': image }
   const r = await authFetch(url, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/ld+json' },
@@ -817,18 +864,22 @@ function renderHome(tag) {
 
 function renderPostCard(post) {
   const card = document.createElement('article')
-  card.className = 'post-card'
+  card.className = 'post-card' + (post.image ? ' post-card-has-cover' : '')
   card.innerHTML = `
-    <h2 class="post-card-title"></h2>
-    <p class="post-card-excerpt"></p>
-    <div class="post-card-meta">
-      <span class="post-card-avatar"></span>
-      <a class="post-card-author" href="#" target="_blank" rel="noopener noreferrer"></a>
-      <span class="post-card-sep">·</span>
-      <span class="post-card-date"></span>
+    ${post.image ? `<div class="post-card-cover"><img loading="lazy" alt=""></div>` : ''}
+    <div class="post-card-body">
+      <h2 class="post-card-title"></h2>
+      <p class="post-card-excerpt"></p>
+      <div class="post-card-meta">
+        <span class="post-card-avatar"></span>
+        <a class="post-card-author" href="#" target="_blank" rel="noopener noreferrer"></a>
+        <span class="post-card-sep">·</span>
+        <span class="post-card-date"></span>
+      </div>
+      <div class="post-card-tags"></div>
     </div>
-    <div class="post-card-tags"></div>
   `
+  if (post.image) card.querySelector('.post-card-cover img').src = post.image
   card.querySelector('.post-card-title').textContent = post.headline
   card.querySelector('.post-card-excerpt').textContent = excerpt(post.body)
   card.querySelector('.post-card-date').textContent = formatDate(post.dateCreated)
@@ -863,8 +914,9 @@ function renderPost(post) {
   const me = meWebId()
   const isMine = post.author === me
   page.innerHTML = `
-    <article class="post">
+    <article class="post${post.image ? ' post-has-cover' : ''}">
       <a class="post-back" href="?">All posts</a>
+      ${post.image ? `<div class="post-cover"><img alt=""></div>` : ''}
       <h1 class="post-title"></h1>
       <header class="post-meta">
         <div class="post-author">
@@ -887,6 +939,7 @@ function renderPost(post) {
       <div class="post-body"></div>
     </article>
   `
+  if (post.image) page.querySelector('.post-cover img').src = post.image
   page.querySelector('.post-title').textContent = post.headline
   page.querySelector('.post-author-date').textContent = formatDate(post.dateCreated)
   renderTagChips(page.querySelector('.post-tags'), post.keywords)
@@ -1084,6 +1137,17 @@ function renderCompose(existing) {
   page.innerHTML = `
     <div class="compose ${previewOn ? 'compose-split' : ''}" id="compose-root">
       <a class="post-back" href="?">Cancel</a>
+      <div class="compose-cover" id="c-cover">
+        <button class="compose-cover-add" id="c-cover-add" type="button">
+          <span class="compose-cover-icon" aria-hidden="true">+</span>
+          Add cover image
+        </button>
+        <div class="compose-cover-preview" id="c-cover-preview" hidden>
+          <img id="c-cover-img" alt="Cover preview"/>
+          <button class="compose-cover-remove" id="c-cover-remove" type="button" title="Remove cover">×</button>
+        </div>
+        <input type="file" id="c-cover-file" accept="image/*" hidden>
+      </div>
       <input class="compose-title" id="c-title" placeholder="Title" autocomplete="off" />
       <input class="compose-tags" id="c-tags" placeholder="Tags (comma-separated, optional)" autocomplete="off" />
       <div class="compose-grid">
@@ -1106,6 +1170,41 @@ function renderCompose(existing) {
   const previewEl = document.getElementById('c-preview')
   const previewBtn = document.getElementById('c-preview-toggle')
   const pubBtn = document.getElementById('c-publish')
+  const coverAddBtn = document.getElementById('c-cover-add')
+  const coverPreviewEl = document.getElementById('c-cover-preview')
+  const coverImgEl = document.getElementById('c-cover-img')
+  const coverRemoveBtn = document.getElementById('c-cover-remove')
+  const coverFileInput = document.getElementById('c-cover-file')
+  let coverUrl = existing?.image || null
+  const showCover = () => {
+    if (coverUrl) {
+      coverImgEl.src = coverUrl
+      coverPreviewEl.hidden = false
+      coverAddBtn.hidden = true
+    } else {
+      coverPreviewEl.hidden = true
+      coverAddBtn.hidden = false
+    }
+  }
+  showCover()
+  coverAddBtn.addEventListener('click', () => coverFileInput.click())
+  coverRemoveBtn.addEventListener('click', () => { coverUrl = null; showCover() })
+  coverFileInput.addEventListener('change', async () => {
+    const f = coverFileInput.files?.[0]
+    if (!f) return
+    coverAddBtn.disabled = true
+    coverAddBtn.innerHTML = '<span class="compose-cover-icon" aria-hidden="true">…</span>Uploading…'
+    try {
+      coverUrl = await uploadCoverImage(f)
+      showCover()
+    } catch (e) {
+      showToast(e.message, null, 6000)
+    } finally {
+      coverAddBtn.disabled = false
+      coverAddBtn.innerHTML = '<span class="compose-cover-icon" aria-hidden="true">+</span>Add cover image'
+      coverFileInput.value = ''
+    }
+  })
   if (existing) {
     titleEl.value = existing.headline
     tagsEl.value = (existing.keywords || []).join(', ')
@@ -1167,12 +1266,14 @@ function renderCompose(existing) {
         ? await updatePost(existing.url, {
             headline: titleEl.value.trim(),
             body: bodyEl.value,
-            keywords
+            keywords,
+            image: coverUrl
           })
         : await savePost({
             headline: titleEl.value.trim(),
             body: bodyEl.value,
-            keywords
+            keywords,
+            image: coverUrl
           })
       showToast(isEdit ? 'Saved.' : 'Published.', null, 2200)
       goPost(url)
