@@ -26,7 +26,12 @@ const state = {
   profiles: new Map(),
   // current view: 'home' | 'post' | 'compose'
   view: 'home',
-  currentPost: null
+  currentPost: null,
+  // Blog identity — derived from the pod owner's WebID profile when we
+  // know who owns this pod. Drives the masthead so /?pod=alice.pod and
+  // /?pod=bob.pod feel like genuinely different blogs.
+  blogOwner: null,        // owner's WebID URL (best-effort guess)
+  blogOwnerProfile: null  // { name, picture, bio } once resolved
 }
 
 // --- helpers ---
@@ -138,7 +143,7 @@ function parseProfile(doc, webId) {
     n['@id'] === '#' + (webId.split('#')[1] || '') ||
     n['@id'] === webId.split('#').pop()
   ) || nodes[0]
-  if (!target) return { name: hostLabel(webId), picture: null }
+  if (!target) return { name: hostLabel(webId), picture: null, bio: null }
   const name =
     target['foaf:name'] || target[FOAF + 'name'] ||
     target['schema:name'] || target[SCHEMA + 'name'] ||
@@ -149,7 +154,54 @@ function parseProfile(doc, webId) {
     target['schema:image'] || target[SCHEMA + 'image'] ||
     target['image'] || null
   const picture = typeof pic === 'string' ? pic : (pic && pic['@id']) || null
-  return { name: String(name || hostLabel(webId)), picture }
+  const bio =
+    target['schema:description'] || target[SCHEMA + 'description'] ||
+    target['bio'] || target['vcard:note'] || null
+  return {
+    name: String(name || hostLabel(webId)),
+    picture,
+    bio: typeof bio === 'string' ? bio : (bio && bio['@value']) || null
+  }
+}
+
+// Best-effort discovery of who owns this pod. Single-user JSS exposes
+// the owner at <origin>/profile/card.jsonld#me. We try that first, fall
+// back to inferring from a post's author when we read one.
+async function discoverBlogOwner(origin) {
+  if (!origin) return null
+  const guess = origin.replace(/\/$/, '') + '/profile/card.jsonld#me'
+  try {
+    const r = await fetch(guess.split('#')[0], { headers: { Accept: 'application/ld+json' } })
+    if (r.ok) return guess
+  } catch {}
+  return null
+}
+
+function renderMasthead() {
+  const brandName = document.querySelector('.brand-name')
+  const brandMark = document.querySelector('.brand-mark')
+  const tag = document.getElementById('blog-tagline')
+  if (!brandName || !tag) return
+  const p = state.blogOwnerProfile
+  if (p?.name) {
+    // Owner-derived blog identity. "Alice's writing" reads natural.
+    const ending = p.name.endsWith('s') ? "'" : "'s"
+    brandName.textContent = p.name + ending + ' writing'
+    brandName.style.fontStyle = 'normal'
+    tag.textContent = p.bio || 'light as a feather'
+    if (p.picture) {
+      brandMark.innerHTML = `<img alt="" src="${escapeHtml(p.picture)}" referrerpolicy="no-referrer">`
+      brandMark.style.padding = '0'
+      brandMark.style.overflow = 'hidden'
+      brandMark.style.borderRadius = '50%'
+      brandMark.style.width = '32px'
+      brandMark.style.height = '32px'
+      brandMark.style.transform = 'translateY(6px)'
+    }
+  } else {
+    brandName.textContent = 'plume'
+    tag.textContent = 'light as a feather'
+  }
 }
 
 // --- blog container + posts ---
@@ -519,12 +571,29 @@ function watchLogin() {
   setInterval(() => {
     const now = meWebId()
     if (now !== last) {
-      const wasNull = !last
       last = now
       renderIdentity()
       // Re-render current view to surface logged-in affordances
       if (state.view === 'home') renderHome()
-      if (wasNull && now && !state.podOrigin) bootForPod(podFromWebId(now))
+      // When login state changes, the right pod target may have changed
+      // too. If the user is now logged in and their WebID-derived pod
+      // differs from what we were defaulting to (e.g. localhost from the
+      // dev-mode fallback), re-target onto the real pod. ?pod= still wins.
+      const hasExplicitPodParam = (() => {
+        try { return !!new URLSearchParams(location.search).get('pod') }
+        catch { return false }
+      })()
+      if (now && !hasExplicitPodParam) {
+        const ownPod = podFromWebId(now)
+        if (ownPod && ownPod !== state.podOrigin) {
+          // Clear cached default so we don't re-pick the wrong pod next time.
+          try {
+            const cached = localStorage.getItem(LS_LAST_POD)
+            if (cached && cached !== ownPod) localStorage.removeItem(LS_LAST_POD)
+          } catch {}
+          bootForPod(ownPod)
+        }
+      }
     }
   }, 400)
 }
@@ -558,19 +627,26 @@ function defaultPod() {
 }
 
 function pickPodOrigin() {
+  // ?pod= overrides everything (explicit user choice).
   try {
     const p = new URLSearchParams(location.search).get('pod')
     if (p) return p
   } catch {}
-  try {
-    const cached = localStorage.getItem(LS_LAST_POD)
-    if (cached) return cached
-  } catch {}
+  // When logged in, prefer the user's own pod (WebID-derived) over any
+  // cached value — otherwise a stale "lastPod" from a different session
+  // (e.g. localhost while developing) clobbers the obvious right answer
+  // once the user is authenticated against a real pod.
   const me = meWebId()
   if (me) {
     const own = podFromWebId(me)
     if (own) return own
   }
+  // Not logged in: cache wins (so visitors return to whichever pod's
+  // blog they were reading last).
+  try {
+    const cached = localStorage.getItem(LS_LAST_POD)
+    if (cached) return cached
+  } catch {}
   return defaultPod()
 }
 
@@ -582,14 +658,42 @@ async function bootForPod(origin) {
   const fp = document.getElementById('footer-pod')
   fp.textContent = origin
   fp.href = origin
+
+  // Kick off owner discovery + posts fetch in parallel
+  const ownerP = discoverBlogOwner(origin).then(async (webId) => {
+    if (!webId) return null
+    state.blogOwner = webId
+    const profile = await fetchProfile(webId)
+    state.blogOwnerProfile = profile
+    renderMasthead()
+    // Update the document title too
+    if (profile?.name) document.title = `${profile.name}'s writing — plume`
+    return profile
+  })
+
   try {
     const posts = await loadPosts()
     state.posts = posts
     state.byUrl = new Map(posts.map(p => [p.url, p]))
+    // If owner discovery failed but a post exists, infer the owner from its author.
+    if (!state.blogOwner && posts.length > 0 && posts[0].author) {
+      state.blogOwner = posts[0].author
+      fetchProfile(posts[0].author).then(p => {
+        state.blogOwnerProfile = p
+        renderMasthead()
+        if (p?.name) document.title = `${p.name}'s writing — plume`
+      })
+    }
   } catch (e) {
-    showToast(`Couldn't load posts: ${e.message}`, null, 6000)
+    // ERR_BLOCKED_BY_CLIENT (Brave Shields), mixed-content blocks, CORS:
+    // surface a friendly hint rather than a raw stack.
+    const msg = /BLOCKED_BY_CLIENT|Failed to fetch|NetworkError/i.test(e.message)
+      ? `Couldn't reach ${origin}. If your pod is on HTTP and plume is on HTTPS, the browser blocks the request. Try running plume from the same origin as the pod, or use HTTPS for the pod.`
+      : `Couldn't load posts: ${e.message}`
+    showToast(msg, null, 8000)
   }
   applyRoute()
+  await ownerP  // not strictly needed but lets the masthead settle before next interaction
 }
 
 function init() {
