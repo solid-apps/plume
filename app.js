@@ -445,11 +445,13 @@ function renderPost(post) {
             <span class="post-author-date"></span>
           </div>
         </div>
-        ${isMine ? `
-          <div class="post-actions">
+        <div class="post-actions">
+          <a class="text-btn" id="post-source" target="_blank" rel="noopener noreferrer" title="Open the JSON-LD resource">View source</a>
+          ${isMine ? `
             <button class="text-btn" id="post-edit">Edit</button>
             <button class="text-btn danger" id="post-delete">Delete</button>
-          </div>` : ''}
+          ` : ''}
+        </div>
       </header>
       <div class="post-body"></div>
     </article>
@@ -462,6 +464,7 @@ function renderPost(post) {
     e.preventDefault()
     goHome()
   })
+  page.querySelector('#post-source').href = post.url
   if (isMine) {
     page.querySelector('#post-edit').addEventListener('click', () => goEdit(post.url))
     page.querySelector('#post-delete').addEventListener('click', async () => {
